@@ -1,3 +1,4 @@
+use pact_verifier::callback_executors::HttpRequestProviderStateExecutor;
 use std::sync::Arc;
 use serde_json::Value;
 use neon::prelude::*;
@@ -198,71 +199,14 @@ struct ProviderStateCallback<'a> {
   timeout: u64
 }
 
-#[async_trait]
-impl ProviderStateExecutor for ProviderStateCallback<'_> {
-  async fn call(self: Arc<Self>, interaction_id: Option<String>, provider_state: &ProviderState, setup: bool, _client: Option<&reqwest::Client>) -> Result<HashMap<String, serde_json::Value>, ProviderStateError> {
-    match self.callback_handlers.get(&provider_state.name) {
-      Some(callback) => {
-        let (sender, receiver) = mpsc::channel();
-        let state = provider_state.clone();
-        let iid = interaction_id.clone();
-        callback.schedule_with(move |cx, this, callback| {
-          let args = if !state.params.is_empty() {
-            let js_parameter = JsObject::new(cx);
-            for (ref parameter, ref value) in state.params {
-              serde_value_to_js_object_attr(cx, &js_parameter, parameter, value).unwrap();
-            };
-            vec![cx.boolean(setup).upcast::<JsValue>(), js_parameter.upcast::<JsValue>()]
-          } else {
-            vec![cx.boolean(setup).upcast::<JsValue>()]
-          };
-          let callback_result = callback.call(cx, this, args);
-          match callback_result {
-            Ok(val) => {
-              if let Ok(vals) = val.downcast::<JsObject>() {
-                let js_props = vals.get_own_property_names(cx).unwrap();
-                let props: HashMap<String, Value> = js_props.to_vec(cx).unwrap().iter().map(|prop| {
-                  let prop_name = prop.downcast::<JsString>().unwrap().value();
-                  let prop_val = vals.get(cx, prop_name.as_str()).unwrap();
-                  (prop_name, js_value_to_serde_value(&prop_val, cx))
-                }).collect();
-                debug!("Provider state callback result = {:?}", props);
-                sender.send(Ok(props)).unwrap();
-              } else {
-                debug!("Provider state callback did not return a map of values. Ignoring.");
-                sender.send(Ok(hashmap!{})).unwrap();
-              }
-            },
-            Err(err) => {
-              error!("Provider state callback for '{}' failed: {}", state.name, err);
-              let error = ProviderStateError { description: format!("Provider state callback for '{}' failed: {}", state.name, err), interaction_id: iid };
-              sender.send(Result::<HashMap<String, serde_json::Value>, ProviderStateError>::Err(error)).unwrap();
-            }
-          };
-        });
-        match receiver.recv_timeout(Duration::from_millis(self.timeout)) {
-          Ok(result) => {
-            debug!("Received {:?} from callback", result);
-            result
-          },
-          Err(_) => Err(ProviderStateError { description: format!("Provider state callback for '{}' timed out after {} ms", provider_state.name, self.timeout), interaction_id })
-        }
-      },
-      None => {
-        error!("No provider state callback defined for '{}'", provider_state.name);
-        Err(ProviderStateError { description: format!("No provider state callback defined for '{}'", provider_state.name), interaction_id })
-      }
-    }
-  }
-}
-
 struct BackgroundTask {
   pub provider_info: ProviderInfo,
   pub pacts: Vec<PactSource>,
   pub filter_info: FilterInfo,
   pub consumers_filter: Vec<String>,
   pub options: VerificationOptions<RequestFilterCallback>,
-  pub state_handlers: HashMap<String, EventHandler>
+  pub state_handlers: HashMap<String, EventHandler>,
+  pub state_change_url: Option<String>
 }
 
 impl Task for BackgroundTask {
@@ -275,11 +219,12 @@ impl Task for BackgroundTask {
     panic::catch_unwind(|| {
       match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime.block_on(async {
-          let provider_state_executor = ProviderStateCallback {
-            callback_handlers: &self.state_handlers,
-            timeout: self.options.request_timeout
-          };
-          pact_verifier::verify_provider_async(self.provider_info.clone(), self.pacts.clone(), self.filter_info.clone(), self.consumers_filter.clone(), self.options.clone(), &Arc::new(provider_state_executor)).await
+          let provider_state_executor = Arc::new(HttpRequestProviderStateExecutor {
+            state_change_url: self.state_change_url.clone(),
+            state_change_body: true,
+            state_change_teardown: true,
+          });
+          pact_verifier::verify_provider_async(self.provider_info.clone(), self.pacts.clone(), self.filter_info.clone(), self.consumers_filter.clone(), self.options.clone(), &provider_state_executor).await
         }),
         Err(err) => {
           error!("Verify process failed to start the tokio runtime: {}", err);
@@ -466,40 +411,7 @@ pub fn verify_provider(mut cx: FunctionContext) -> JsResult<JsUndefined> {
 
   let request_timeout = get_integer_value(&mut cx, &config, "callbackTimeout").unwrap_or(5000);
 
-  let request_filter = match config.get(&mut cx, "requestFilter") {
-    Ok(request_filter) => match request_filter.downcast::<JsFunction>() {
-      Ok(val) => {
-        let this = cx.this();
-        Some(Arc::new(RequestFilterCallback {
-          callback_handler: EventHandler::new(&cx, this, val),
-          timeout: request_timeout
-        }))
-      },
-      Err(_) => None
-    },
-    _ => None
-  };
-
-  debug!("request_filter done");
-
-  let mut callbacks = hashmap![];
-  match config.get(&mut cx, "stateHandlers") {
-    Ok(state_handlers) => match state_handlers.downcast::<JsObject>() {
-      Ok(state_handlers) => {
-        let this = cx.this();
-        let props = state_handlers.get_own_property_names(&mut cx).unwrap();
-        for prop in props.to_vec(&mut cx).unwrap() {
-          let prop_name = prop.downcast::<JsString>().unwrap().value();
-          let prop_val = state_handlers.get(&mut cx, prop_name.as_str()).unwrap();
-          if let Ok(callback) = prop_val.downcast::<JsFunction>() {
-            callbacks.insert(prop_name, EventHandler::new(&cx, this, callback));
-          }
-        };
-      },
-      Err(_) => ()
-    },
-    _ => ()
-  };
+  let callbacks = hashmap![];
 
   let publish = match config.get(&mut cx, "publishVerificationResult") {
     Ok(publish) => match publish.downcast::<JsBoolean>() {
@@ -543,6 +455,8 @@ pub fn verify_provider(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     _ => false
   };
 
+  let state_change_url = get_string_value(&mut cx, &config, "providerStatesSetupUrl");
+
   let filter_info = interaction_filter();
 
   match filter_info {
@@ -559,7 +473,7 @@ pub fn verify_provider(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     publish,
     provider_version,
     build_url: None,
-    request_filter,
+    request_filter: None,
     provider_tags,
     disable_ssl_verification,
     request_timeout,
@@ -567,7 +481,7 @@ pub fn verify_provider(mut cx: FunctionContext) -> JsResult<JsUndefined> {
   };
 
   debug!("Starting background task");
-  BackgroundTask { provider_info, pacts, filter_info, consumers_filter, options, state_handlers: callbacks }.schedule(callback);
+  BackgroundTask { provider_info, pacts, filter_info, consumers_filter, options, state_handlers: callbacks, state_change_url }.schedule(callback);
 
   debug!("Done");
   Ok(cx.undefined())

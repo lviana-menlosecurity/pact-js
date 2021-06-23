@@ -46,9 +46,17 @@ export const createProxy = (
   // Setup provider state handler
   app.post(stateSetupPath, createProxyStateHandler(config));
 
+  logger.info('debug request/response logging enabled');
+  logger.debug({
+    changeOrigin: config.changeOrigin === true,
+    secure: config.validateSSL === true,
+    target: config.providerBaseUrl,
+  });
+
   // Proxy server will respond to Verifier process
   app.all('/*', (req, res) => {
-    logger.debug('Proxing', req.path);
+    logger.debug(`Proxying ${req.path}`);
+
     proxy.web(req, res, {
       changeOrigin: config.changeOrigin === true,
       secure: config.validateSSL === true,

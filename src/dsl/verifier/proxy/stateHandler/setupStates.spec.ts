@@ -24,7 +24,7 @@ describe('#setupStates', () => {
     stateHandlers: {
       [state]: () => {
         executed = true;
-        return Promise.resolve('done');
+        return Promise.resolve();
       },
     },
   });
